@@ -1,0 +1,51 @@
+From: Tezuka firmware
+Subject: [PATCH] net: macb: allow jumbo frames on Zynq-7000
+
+Streaming IQ over the board's gigabit link tops out around 480-560
+Mbit/s, and that ceiling is a per-packet CPU wall, not bandwidth: during
+a saturating transfer both Cortex-A9 cores sit at 0% idle with roughly
+63% system and 33% softirq time. At MTU 1500 with no TSO on this
+controller, 57 MiB/s is about 40k transmitted segments per second, each
+one built and completed in software. Fewer, larger frames is the only
+lever that meaningfully reduces that cost.
+
+zynq_config does not set MACB_CAPS_JUMBO, so macb_change_mtu() refuses
+any MTU above 1500:
+
+  # ip link set eth0 mtu 4000
+  RTNETLINK answers: Invalid argument
+
+The zynqmp_config immediately below it does set the flag together with
+.jumbo_max_len, and the Zynq-7000 GEM has the same Jumbo Max Length
+register that macb_init() programs via gem_writel(bp, JML, ...). Set
+both here in the same way.
+
+This changes nothing on its own: the interface still comes up at MTU
+1500, and the capability only permits a larger MTU to be configured. On
+this firmware the rootfs is a RAM disk and the MTU is not persisted, so
+a reboot returns the board to 1500 regardless.
+
+Caveat worth recording: the Zynq-7000 GEM's TX packet buffer is 4 KB, so
+a full 9000 byte frame may not be storable and forwardable even though
+the JML register accepts 10240. The usable MTU is expected to be nearer
+4000, which is still about 2.6x fewer packets. Raise the MTU
+incrementally and verify, and remember every hop plus the peer has to
+agree or traffic silently blackholes.
+
+Signed-off-by: Tezuka firmware
+---
+--- a/drivers/net/ethernet/cadence/macb_main.c	2026-09-05 12:30:43
++++ b/drivers/net/ethernet/cadence/macb_main.c	2026-09-05 12:30:43
+@@ -4960,10 +4960,11 @@
+ 
+ static const struct macb_config zynq_config = {
+ 	.caps = MACB_CAPS_GIGABIT_MODE_AVAILABLE | MACB_CAPS_NO_GIGABIT_HALF |
+-		MACB_CAPS_NEEDS_RSTONUBR,
++		MACB_CAPS_NEEDS_RSTONUBR | MACB_CAPS_JUMBO,
+ 	.dma_burst_length = 16,
+ 	.clk_init = macb_clk_init,
+ 	.init = macb_init,
++	.jumbo_max_len = 10240,
+ 	.usrio = &macb_default_usrio,
+ };
+ 
