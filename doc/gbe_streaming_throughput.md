@@ -1,10 +1,11 @@
 # GbE IQ streaming throughput: analysis, changes, plan
 
-Status: written 2026-09-05 from source reading only. Nothing in this
-document has been built or run on hardware yet. Every change below is
-behind a runtime knob so it can be switched off from the u-boot
-environment without a rebuild. Verify with the procedure at the end
-before trusting any of it.
+Status: analysis written 2026-09-05 from source reading, then partly
+REFUTED by measurement on a real plutoskyr2 the same day. Read
+"Measured on hardware" below before anything else: the headline
+hypothesis in "Where the bytes go today" is wrong. The changes are all
+behind runtime knobs and remain safe to carry, but the kernel patch does
+not address the actual limit.
 
 ## Symptom
 
@@ -20,6 +21,195 @@ stable ~50 Msps over GbE.
 | 61.44 Msps | 123 MB/s = 983 Mbit/s | does not fit; impossible over GbE |
 
 So the wire is not the limit until ~55 Msps. The device CPU is.
+
+## Measured on hardware (2026-09-05, plutoskyr2, tezuka v0.3.19)
+
+Run on a real PlutoSky R2 (Z7020/AD9361, 2 cores, kernel 6.12.77,
+SD-booted, eth0 linked at 1000 Mb/s full duplex, no interface errors),
+on the **unpatched** shipping firmware. cs8 is selected by enabling only
+`voltage0`, which is what drives the fabric's cs12-to-cs8 mux.
+
+| cs8 test, 256 KiB blocks | 30.72 Msps | 50 Msps | 61.44 Msps |
+|---|---|---|---|
+| ideal for the sample rate | 58 MiB/s | 95 MiB/s | 117 MiB/s |
+| `iio_readdev` to `/dev/null` | 58 | 95 | 117 |
+| `iio_readdev` through a pipe | 58 | 95 | 117 |
+| through `iiod` over loopback | 57 | 88 | 113 |
+
+Reading the table:
+
+- **Writing to `/dev/null` proves nothing on its own.** `write()` to the
+  null device never reads the user buffer, so that row measures DMA
+  completion, not CPU. The pipe row forces a genuine copy out of the
+  uncached mapping and is the one that matters. Note that
+  `tools/iio_benchmark.sh` uses the `/dev/null` form, so its numbers are
+  a DMA ceiling, not a copy ceiling.
+- **The uncached DMA read is not the bottleneck.** The board reads every
+  byte out of the non-cacheable mapping at the full 61.44 Msps rate
+  (117 MiB/s), while also paying pipe overhead. The estimate earlier in
+  this document, that the uncached copy costs ~65% of a core at
+  100 MB/s, is simply wrong. It is comfortably under.
+- **iiod is not the bottleneck either.** Its complete serving path
+  sustains 113 MiB/s at 61.44 Msps with the receiving client running on
+  the *same* two cores. iiod itself sat at ~20% of a core at 30.72 Msps.
+
+So nothing on the board between the ADC and the socket explains a
+30 Msps ceiling.
+
+### What the loopback test does NOT cover
+
+Loopback has an MTU of 65536 and a `noqueue` qdisc. That run therefore
+skipped all three of:
+
+1. **Packet rate.** At 117 MiB/s, loopback moved roughly 1.8k packets/s.
+   Real Ethernet at MTU 1500 moves about 80k/s, and the Zynq GEM has no
+   TSO (`zynq_config` in `macb_main.c` sets neither `MACB_CAPS_JUMBO`
+   nor any LSO capability), so every one of those segments is built and
+   completed in software.
+2. **`fq` + BBR.** `S96networkcong` puts both on eth0. Loopback used
+   neither, so the per-packet pacing timer was never exercised.
+3. **The macb driver and the GEM itself**, including TX ring management
+   and interrupt load, none of which loopback touches.
+
+The remaining candidates are exactly those three, plus anything outside
+the board (switch, cabling, and the client host). The per-packet
+argument from the original analysis survives; the memory-bandwidth
+argument does not.
+
+### End to end over real Ethernet: this is the bottleneck
+
+Measured against a wired 10GbE Debian host on the same subnet, so the
+board's own gigabit link is the only constrained hop. Client is
+`iio_readdev` from libiio 0.24 pulling cs8 across the network.
+
+| requested rate | ideal | over GbE |
+|---|---|---|
+| 30.72 Msps | 58 MiB/s | 59 MiB/s |
+| 40 Msps | 76 MiB/s | 59 MiB/s |
+| 50 Msps | 95 MiB/s | 58 MiB/s |
+| 61.44 Msps | 117 MiB/s | 63 MiB/s |
+
+The network path saturates at 59 to 63 MiB/s no matter what the ADC is
+doing. 30.72 Msps cs8 needs 58 MiB/s, which is exactly at that ceiling,
+and that is the whole explanation for the reported ~30 Msps limit.
+
+Raw TCP with no IIO involved, board to the same host, measured from the
+board's own `tx_bytes` counter:
+
+| streams | throughput |
+|---|---|
+| 1 | 57 MiB/s (478 Mbit/s) |
+| 4 in parallel | 66 MiB/s (560 Mbit/s) |
+
+So iiod is giving up essentially nothing: a single raw TCP stream and
+iiod land within a few percent of each other. The board's TCP path tops
+out near 480 to 560 Mbit/s on a gigabit link.
+
+### It is CPU, and it is per-packet
+
+Sampled during the four-stream raw TCP run:
+
+```
+CPU:  3.0% usr 63.6% sys  0.0% nic  0.0% idle  0.0% io  0.0% irq 33.3% sirq
+```
+
+Zero idle, with the time split between system and softirq, i.e. the
+network stack and the driver. Both cores are consumed; four parallel
+streams bought only 17% over one, which is what a CPU wall looks like
+rather than a window-size or pacing limit. The eth0 interrupt is
+entirely on core 0 (`/proc/interrupts`), RPS is disabled
+(`rps_cpus` is 0) and XPS does not exist on the queue, so there is no
+spreading to lean on, and no idle capacity to spread into anyway.
+
+At 1500 bytes and no TSO, 57 MiB/s is roughly 40k transmitted segments
+per second plus the returning ACKs, every one built and completed in
+software on a 667 MHz Cortex-A9.
+
+### Congestion control and qdisc are not the cause
+
+Swapped live on the board and re-measured at 61.44 Msps:
+
+| eth0 config | over GbE |
+|---|---|
+| `fq` + BBR (shipped default) | 63 MiB/s |
+| `pfifo_fast` + cubic | 63 MiB/s |
+
+No difference. **The `tcp_profile=lan` knob added in this branch does
+not help**, and the earlier guess that BBR pacing was implicated is
+wrong. The knob is harmless and left in place, defaulting to the
+existing `wan` behaviour, but it is not a fix.
+
+### The one lever with real headroom: jumbo frames
+
+If the wall is per-packet cost, the fix is fewer, bigger packets. The
+driver refuses today:
+
+```
+# ip link set eth0 mtu 4000
+RTNETLINK answers: Invalid argument
+```
+
+`zynq_config` in `drivers/net/ethernet/cadence/macb_main.c` does not set
+`MACB_CAPS_JUMBO`, so `macb_change_mtu` caps the MTU at 1500.
+`zynqmp_config` right above it does set it, along with
+`.jumbo_max_len = 10240`, and the Zynq-7000 GEM has the same Jumbo Max
+Length register that `gem_writel(bp, JML, ...)` writes. The change is
+two lines:
+
+```c
+static const struct macb_config zynq_config = {
+	.caps = MACB_CAPS_GIGABIT_MODE_AVAILABLE | MACB_CAPS_NO_GIGABIT_HALF |
+		MACB_CAPS_NEEDS_RSTONUBR | MACB_CAPS_JUMBO,
+	.dma_burst_length = 16,
+	.clk_init = macb_clk_init,
+	.init = macb_init,
+	.jumbo_max_len = 10240,
+	.usrio = &macb_default_usrio,
+};
+```
+
+Two caveats before anyone gets excited. First, the Zynq-7000 GEM's TX
+packet buffer is only 4 KB, so a 9000 byte frame very likely cannot be
+stored and forwarded; the practical ceiling may be nearer MTU 3800 to
+4000. That still cuts packet count by about 2.6x, which is the right
+order to matter here. Second, the whole path has to agree: switch and
+client both need the larger MTU or the flow silently blackholes.
+
+The risk of carrying the capability flag is low, because it changes
+nothing until someone raises the MTU, and MTU is not persisted across a
+reboot on this RAM-disk rootfs. So it can be tested with
+`ip link set eth0 mtu 4000` and undone by rebooting.
+
+### Revised verdict on the changes in this branch
+
+| change | verdict |
+|---|---|
+| kernel patch 0008, cacheable mmap blocks | targets a path with headroom; not the fix. Compiles and builds clean, but should default to off |
+| `tcp_profile=lan` | measured, no effect |
+| IRQ pinning | untested; unlikely to help much, since both cores are already saturated |
+| jumbo frames | not yet implemented, and the only candidate with a plausible path to 50 Msps |
+
+Reaching 50 Msps needs 100 MB/s, or 800 Mbit/s, against a measured
+480 to 560 Mbit/s CPU wall. That is roughly a 40% reduction in CPU cost
+per byte. Nothing in this branch delivers that. Jumbo frames plausibly
+could, and nothing else identified so far comes close.
+
+### What this means for the changes below
+
+- **Kernel patch 0008 (cacheable mmap blocks) does not fix this.** It
+  optimizes a path with plenty of headroom. It is still a real reduction
+  in CPU per byte and is harmless behind its default-off module
+  parameter, but shipping it as "the fix" would be wrong, and it should
+  not be enabled on the strength of this document alone.
+- **`tcp_profile=lan` is now the most interesting change**, because
+  dropping `fq` and BBR for `pfifo_fast` and cubic removes one of the
+  three things loopback skipped, and loopback's own configuration was
+  effectively the no-pacing case that ran at full rate.
+- **IRQ pinning** still plausibly helps, since it separates GEM
+  interrupt work from iiod's core, and GEM interrupt work is one of the
+  untested three.
+- **Jumbo frames are not available** on this controller, so that lever
+  is closed regardless.
 
 ## Where the bytes go today
 
@@ -55,7 +245,9 @@ Three CPU costs, all on the one core iiod is pinned to:
    `PREEMPT`. All shared interrupts default to CPU0 while iiod is on
    CPU1, together with maia-httpd, mosquitto, classifier and avahi.
 
-Rough single-core budget:
+Rough single-core budget as originally estimated. The measurements
+above show the "uncached copy" column is far too pessimistic; keep this
+only as a record of the reasoning that was tested and found wanting:
 
 | Rate | Uncached copy | TCP TX + ACK + qdisc | Total on core 1 |
 |---|---|---|---|
