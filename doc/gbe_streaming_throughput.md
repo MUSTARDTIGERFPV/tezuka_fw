@@ -180,19 +180,126 @@ nothing until someone raises the MTU, and MTU is not persisted across a
 reboot on this RAM-disk rootfs. So it can be tested with
 `ip link set eth0 mtu 4000` and undone by rebooting.
 
+## Measured on the built firmware (same board, flashed)
+
+Built with the container fixes, flashed to the SD card, booted as
+`tezuka-v0.3.21-6-gac55`. Same 10GbE client, cs8, `iio_readdev` over the
+network. Everything below is measured, not estimated.
+
+### Kernel patch 0008 is a regression: 25% slower
+
+| `cached_mmap` | 30.72 Msps | 40 Msps | 50 Msps | 61.44 Msps |
+|---|---|---|---|---|
+| on (Y) | 45 MiB/s | 48 | 44 | 47 |
+| off (N) | 58 MiB/s | 61 | 60 | 60 |
+
+Toggled live at `/sys/module/industrialio_buffer_dma/parameters/cached_mmap`
+with nothing else changed. Backing the blocks with cacheable memory
+costs about a quarter of the throughput.
+
+The reason is now obvious in hindsight. The board is CPU-bound in the
+network stack, so CPU is the scarce resource, and the patch *adds* CPU
+work: an L1 by-MVA pass plus a PL310 by-PA pass across every block,
+twice per buffer. It removes uncached reads that were never the
+constraint and pays for them with cache maintenance that is. **The
+default in S21misc is now 0.** With it off, the new firmware matches the
+old one (58-61 vs 59-63 MiB/s), so nothing else in this branch
+regressed.
+
+### Overclocking is the real win: 30 to 40 Msps
+
+The firmware already ships alternative FSBLs in `sdimg/overclock/`, and
+post-image builds one per `.elf` in the board's `bitstream/overclock/`.
+Selecting one is just copying it over `/boot/BOOT.bin` and rebooting.
+
+| CPU / DDR | BogoMIPS | 30.72 Msps | 40 Msps | 50 Msps | 61.44 Msps |
+|---|---|---|---|---|---|
+| 667 / 533 (stock) | 333.33 | 58 MiB/s | 61 | 60 | 60 |
+| 950 / 600 | 474.99 | 58 | **75** | 71 | 74 |
+| 1100 / 750 | - | crashed, see below |
+
+At 950 MHz, **40 Msps streams at full rate** (75 MiB/s against an ideal
+of 76) and the ceiling moves from about 60 to about 74 MiB/s. That is
+1.23x throughput for 1.42x clock, sublinear but exactly the direction a
+CPU-bound limit predicts. 950 MHz looked stable: repeated 64 MB
+re-reads were consistent, and the only dmesg complaints were the
+pre-existing benign ones (spi-nor ear reg, cpuidle disabled by cmdline,
+FAT dirty from the reboot).
+
+### 1100 / 750 is not usable on this unit
+
+It booted and answered twice, then died and never returned, dropping off
+the network entirely (MAC aged out of the peer's ARP table). Notably it
+reported BogoMIPS 474.99, the *950* value, so the ARM PLL does not
+appear to have reached 1100 in the first place. Boot-then-die under
+light load with DDR pushed to 750 MHz is the signature of memory
+instability, and this repo already documents DDR marginality on related
+hardware in `vendor_report_ddr_issue.md`.
+
+Recovery required physically pulling the SD card, because `/boot/BOOT.bin`
+is what boots and it now held the bad image, so every reset retried it.
+**Before selecting an overclock FSBL, save the working one first**
+(`cp /boot/BOOT.bin /boot/BOOT.bin.stock667`), which at least puts the
+rescue file on the same partition the card is mounted from.
+
+### Jumbo frames: board side works, path does not
+
+With patch 0009 in, the MTU error changes from `Invalid argument` to
+`Device or resource busy`, i.e. the capability is there and macb simply
+refuses to resize a running interface. Down, resize, up works:
+
+```
+ip link set eth0 down; ip link set eth0 mtu 4000; ip link set eth0 up
+```
+
+MTU 4000 came up cleanly and the board kept its DHCP lease. But with the
+peer also raised to 9000, frames above 1500 are dropped somewhere in
+between:
+
+| ICMP payload | result |
+|---|---|
+| 1472 (1500 frame) | passes |
+| 2972 | blocked |
+| 3972 | blocked |
+
+Both endpoints were confirmed raised, so the switch between them is not
+passing jumbo. Enabling it there is the remaining prerequisite, and
+until then jumbo cannot be evaluated end to end. Note also that raising
+the MTU on the 10GbE peer's `ixgbe` port bounces the link briefly.
+
+The indirect evidence for jumbo remains strong: the same board, same
+kernel and same TCP stack does 113 MiB/s over loopback at a 65536 MTU
+versus about 60 MiB/s over Ethernet at 1500. Packet count is the
+difference.
+
+### Where 50 Msps actually stands
+
+50 Msps cs8 needs 95 MiB/s. Measured best is 75 MiB/s at 950 MHz, so
+roughly 27% short.
+
+| lever | measured effect |
+|---|---|
+| 950 MHz overclock | 60 to 74 MiB/s ceiling, 40 Msps clean |
+| 1100 MHz overclock | unusable on this unit |
+| kernel patch 0008 | -25%, now default off |
+| `tcp_profile=lan` | no effect |
+| jumbo frames | untestable until the switch passes it |
+
+Overclocking to 950 plus working jumbo frames is the combination with a
+credible path to 50 Msps, and jumbo is the untested half.
+
 ### Revised verdict on the changes in this branch
 
 | change | verdict |
 |---|---|
-| kernel patch 0008, cacheable mmap blocks | targets a path with headroom; not the fix. Compiles and builds clean, but should default to off |
+| kernel patch 0008, cacheable mmap blocks | measured 25% REGRESSION, now defaults off. Keep only as an experiment, or drop |
 | `tcp_profile=lan` | measured, no effect |
-| IRQ pinning | untested; unlikely to help much, since both cores are already saturated |
-| jumbo frames | not yet implemented, and the only candidate with a plausible path to 50 Msps |
+| IRQ pinning | no measurable effect; both cores are saturated regardless |
+| patch 0009, jumbo capability | works on the board; blocked by the switch, so still unevaluated |
+| overclock to 950/600 | not a code change, but the only measured win: 30 to 40 Msps |
 
-Reaching 50 Msps needs 100 MB/s, or 800 Mbit/s, against a measured
-480 to 560 Mbit/s CPU wall. That is roughly a 40% reduction in CPU cost
-per byte. Nothing in this branch delivers that. Jumbo frames plausibly
-could, and nothing else identified so far comes close.
+See "Measured on the built firmware" above for the numbers behind each
+of these.
 
 ### What this means for the changes below
 
