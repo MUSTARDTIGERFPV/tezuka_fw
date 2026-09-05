@@ -59,7 +59,7 @@
 +        mountpoints+=( "${real_path}" )
 +        br2_external_container_env="${br2_external_container_env}${real_path}:"
 +    done
-+    docker_opts+=( --env BR2_EXTERNAL="${br2_external_container_env}" )
++    docker_opts+=( --env BR2_EXTERNAL="${br2_external_container_env%:}" )
 +fi
 +
  if [ "${BR2_DL_DIR}" ]; then
