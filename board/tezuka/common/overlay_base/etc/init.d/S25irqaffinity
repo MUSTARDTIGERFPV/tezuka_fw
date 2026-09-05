@@ -1,0 +1,48 @@
+#!/bin/sh
+# Pin the interrupts that matter for IQ streaming to fixed cores.
+#
+# By default the Zynq GIC delivers every shared interrupt to CPU0, while
+# S23udc pins iiod to CPU1. Keep the network stack's interrupt work (GEM
+# TX completion, ACK RX via NAPI) on CPU0 so it does not compete with iiod,
+# and put the ADC/DAC DMA completion on CPU1 so the block-done wakeup of
+# iiod is core-local instead of an IPI.
+#
+# Disable with: fw_setenv irq_affinity off
+# See doc/gbe_streaming_throughput.md.
+
+IRQ_AFFINITY=$(fw_printenv -n irq_affinity 2> /dev/null || echo on | tr -cd '[a-zA-Z0-9]._-')
+NB_CORE=$(nproc 2> /dev/null || echo 1)
+
+# pin_irq <substring matched against /proc/interrupts line> <cpu mask (hex)>
+pin_irq() {
+	for irq in $(grep -i "$1" /proc/interrupts | cut -d: -f1 | tr -d ' '); do
+		[ -w "/proc/irq/$irq/smp_affinity" ] || continue
+		echo "$2" > "/proc/irq/$irq/smp_affinity" 2>/dev/null && \
+			echo "  irq $irq ($1) -> cpu mask $2"
+	done
+}
+
+case "$1" in
+  start)
+	if [ "$IRQ_AFFINITY" != "on" ] || [ "$NB_CORE" != "2" ]; then
+		echo "IRQ affinity: skipped (irq_affinity=$IRQ_AFFINITY, cores=$NB_CORE)"
+		exit 0
+	fi
+	echo "IRQ affinity for streaming:"
+	# Gigabit Ethernet (macb registers its IRQ under the netdev name)
+	pin_irq "eth0" 1
+	# ADI axi_dmac instances: RX at 7c400000, TX at 7c420000 in every board DTS
+	pin_irq "7c400000" 2
+	pin_irq "7c420000" 2
+	;;
+  stop)
+	;;
+  restart|reload)
+	"$0" start
+	;;
+  *)
+	echo "Usage: $0 {start|stop|restart}"
+	exit 1
+esac
+
+exit 0

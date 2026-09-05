@@ -1,19 +1,34 @@
 #!/bin/sh
 
-start() {
-	# Default qdisc for interfaces created after this point
-	echo "fq" > /proc/sys/net/core/default_qdisc
+# tcp_profile (u-boot env):
+#   wan (default) - BBR + fq pacing. Right for DATV/pluto_stream over the
+#                   internet, costs an hrtimer pacing event per packet.
+#   lan           - cubic + pfifo_fast. Cheapest per-packet path for IQ
+#                   streaming to a host on the same switch.
+# See doc/gbe_streaming_throughput.md.
+TCP_PROFILE=$(fw_printenv -n tcp_profile 2> /dev/null || echo wan | tr -cd '[a-z]')
 
-	# TCP congestion control + send buffer tuning
-	sysctl -qw net.ipv4.tcp_congestion_control=bbr
+start() {
 	sysctl -qw net.core.wmem_default=4194304
 	sysctl -qw net.core.wmem_max=4194304
 	sysctl -qw net.ipv4.tcp_wmem="4096 1048576 4194304"
 	echo 5000 > /proc/sys/net/core/netdev_max_backlog
 
-	# Apply FQ explicitly to eth0 (default_qdisc above only covers new interfaces)
 	ethtool -K eth0 tx on sg on gso on gro on 2>/dev/null
-	tc qdisc replace dev eth0 root fq 2>/dev/null
+
+	if [ "$TCP_PROFILE" = "lan" ]; then
+		echo "pfifo_fast" > /proc/sys/net/core/default_qdisc
+		sysctl -qw net.ipv4.tcp_congestion_control=cubic
+		tc qdisc replace dev eth0 root pfifo_fast 2>/dev/null
+	else
+		# Default qdisc for interfaces created after this point
+		echo "fq" > /proc/sys/net/core/default_qdisc
+		# TCP congestion control + send buffer tuning
+		sysctl -qw net.ipv4.tcp_congestion_control=bbr
+		# Apply FQ explicitly to eth0 (default_qdisc above only covers new interfaces)
+		tc qdisc replace dev eth0 root fq 2>/dev/null
+	fi
+	echo "TCP profile: $TCP_PROFILE"
 }
 
 stop() {

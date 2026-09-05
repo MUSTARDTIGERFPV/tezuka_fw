@@ -1,0 +1,250 @@
+From: Tezuka firmware
+Subject: [PATCH] iio: buffer-dma: optional cacheable backing for legacy mmap blocks
+
+On Zynq-7000 the IIO DMA controllers sit on the HP ports, which do not
+snoop the CPU caches, so dma_alloc_coherent() hands back memory that is
+mapped Normal non-cacheable. Every byte iiod streams to a network client
+is read by the CPU out of that mapping (tcp_sendmsg copy_from_user), and
+uncached reads on a Cortex-A9 are several times slower than cached ones.
+That copy is the dominant CPU cost of network streaming and is what caps
+complex8 streaming around 30 Msps on a GbE board.
+
+Add a module parameter, industrialio_buffer_dma.cached_mmap (default 0),
+that makes blocks allocated through the legacy mmap ABI (the one libiio
+0.x uses) come from ordinary cacheable memory instead:
+
+ - allocation uses dma_alloc_attrs(DMA_ATTR_NO_KERNEL_MAPPING), which
+   keeps using CMA (so large blocks and highmem still work), returns a
+   physically contiguous page cookie, and creates no kernel mapping;
+ - mmap() maps those pages with the default (cacheable) vm_page_prot via
+   remap_pfn_range() instead of dma_mmap_coherent();
+ - before a block is handed to the DMA controller it is invalidated
+   (input) or written back (output) with dma_sync_single_for_device();
+ - when userspace dequeues a completed block it is invalidated with
+   dma_sync_single_for_cpu() before the CPU is allowed to read it. This
+   is done in the ioctl (process) context on purpose: invalidating a
+   multi-megabyte block line by line takes milliseconds and does not
+   belong in the DMA completion tasklet.
+
+The fileio (read/write) blocks and the non-legacy DMABUF path are left
+untouched. Only blocks allocated after the parameter changes are
+affected, so it is safe to flip at boot from an init script.
+
+Freshly allocated blocks are zeroed through a temporary kmap and the
+zeros written back, since the no-mapping allocation does not zero.
+
+The resulting user mapping is VM_PFNMAP, so get_user_pages() and thus
+MSG_ZEROCOPY on it still fail; that is a follow-up (see
+doc/gbe_streaming_throughput.md in the tezuka tree).
+
+Signed-off-by: Tezuka firmware
+---
+--- a/include/linux/iio/buffer-dma.h	2026-09-05 02:35:53
++++ b/include/linux/iio/buffer-dma.h	2026-09-05 02:36:26
+@@ -18,6 +18,7 @@
+ struct iio_dma_buffer_ops;
+ struct device;
+ struct dma_buf_attachment;
++struct page;
+ struct dma_fence;
+ struct sg_table;
+ 
+@@ -81,6 +82,15 @@
+ 	bool cyclic;
+ 	bool fileio;
+ 
++	/*
++	 * Legacy mmap blocks may be backed by cacheable memory. Then @page is
++	 * the physically contiguous backing page cookie returned by
++	 * dma_alloc_attrs(DMA_ATTR_NO_KERNEL_MAPPING), @vaddr is NULL and the
++	 * core does explicit cache maintenance around every DMA transfer.
++	 */
++	bool cached;
++	struct page *page;
++
+ 	struct sg_table *sg_table;
+ 	struct dma_fence *fence;
+ };
+--- a/drivers/iio/buffer/industrialio-buffer-dma.c	2026-09-05 02:35:53
++++ b/drivers/iio/buffer/industrialio-buffer-dma.c	2026-09-05 02:35:53
+@@ -21,6 +21,8 @@
+ #include <linux/dma-fence.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/sizes.h>
++#include <linux/mm.h>
++#include <linux/highmem.h>
+ 
+ /*
+  * For DMA buffers the storage is sub-divided into so called blocks. Each block
+@@ -98,6 +100,52 @@
+ #ifdef CONFIG_IIO_DMA_BUF_MMAP_LEGACY
+ static unsigned int iio_dma_buffer_max_block_size = SZ_16M;
+ module_param_named(max_block_size, iio_dma_buffer_max_block_size, uint, 0644);
++
++/*
++ * When set, blocks allocated through the legacy mmap ABI (BLOCK_ALLOC ioctl)
++ * are backed by ordinary cacheable memory instead of dma_alloc_coherent()
++ * memory, and the core performs explicit cache maintenance around each DMA
++ * transfer. On platforms without hardware DMA coherency (Zynq-7000 HP ports)
++ * the coherent allocation is mapped non-cacheable, and CPU reads out of it
++ * are several times slower than cached reads. That uncached copy is the
++ * dominant CPU cost when iiod streams samples over the network.
++ *
++ * Only affects blocks allocated after the parameter is changed.
++ */
++static bool iio_dma_buffer_cached_mmap;
++module_param_named(cached_mmap, iio_dma_buffer_cached_mmap, bool, 0644);
++MODULE_PARM_DESC(cached_mmap,
++	"Back legacy mmap blocks with cacheable memory (explicit cache maintenance)");
++
++static enum dma_data_direction
++iio_dma_buffer_dma_dir(struct iio_dma_buffer_queue *queue)
++{
++	if (queue->buffer.direction == IIO_BUFFER_DIRECTION_IN)
++		return DMA_FROM_DEVICE;
++	return DMA_TO_DEVICE;
++}
++
++/* Hand a cached block to the DMA controller: clean (out) or invalidate (in) */
++static void iio_dma_buffer_sync_for_device(struct iio_dma_buffer_block *block,
++					   size_t len)
++{
++	if (!block->cached || !len)
++		return;
++
++	dma_sync_single_for_device(block->queue->dev, block->phys_addr, len,
++				   iio_dma_buffer_dma_dir(block->queue));
++}
++
++/* Take a cached block back from the DMA controller before the CPU reads it */
++static void iio_dma_buffer_sync_for_cpu(struct iio_dma_buffer_block *block,
++					size_t len)
++{
++	if (!block->cached || !len)
++		return;
++
++	dma_sync_single_for_cpu(block->queue->dev, block->phys_addr, len,
++				iio_dma_buffer_dma_dir(block->queue));
++}
+ #endif
+ 
+ static void iio_buffer_block_release(struct kref *kref)
+@@ -109,8 +157,14 @@
+ 	WARN_ON(block->fileio && block->state != IIO_BLOCK_STATE_DEAD);
+ 
+ #ifdef CONFIG_IIO_DMA_BUF_MMAP_LEGACY
+-	dma_free_coherent(block->queue->dev, PAGE_ALIGN(block->block.size),
+-					block->vaddr, block->phys_addr);
++	if (block->cached)
++		dma_free_attrs(block->queue->dev, PAGE_ALIGN(block->block.size),
++			       block->page, block->phys_addr,
++			       DMA_ATTR_NO_KERNEL_MAPPING);
++	else
++		dma_free_coherent(block->queue->dev,
++				  PAGE_ALIGN(block->block.size),
++				  block->vaddr, block->phys_addr);
+ #else
+ 	if (block->fileio) {
+ 		dma_free_coherent(queue->dev, PAGE_ALIGN(block->size),
+@@ -504,6 +558,19 @@
+ 
+ 	block->state = IIO_BLOCK_STATE_ACTIVE;
+ 	iio_buffer_block_get(block);
++
++#ifdef CONFIG_IIO_DMA_BUF_MMAP_LEGACY
++	/*
++	 * Input: the dmaengine backend resets bytes_used to the block size
++	 * before submitting, so drop every line of the block from the caches.
++	 * Output: write back exactly what the DMA is going to read.
++	 */
++	if (queue->buffer.direction == IIO_BUFFER_DIRECTION_IN)
++		iio_dma_buffer_sync_for_device(block,
++					       PAGE_ALIGN(block->block.size));
++	else
++		iio_dma_buffer_sync_for_device(block, block->block.bytes_used);
++#endif
+ 
+ 	ret = queue->ops->submit(queue, block);
+ 	if (ret) {
+@@ -536,11 +603,41 @@
+ 	if (!block)
+ 		return NULL;
+ 
+-	block->vaddr = dma_alloc_coherent(queue->dev, PAGE_ALIGN(size),
+-					  &block->phys_addr, GFP_KERNEL);
+-	if (!block->vaddr) {
+-		kfree(block);
+-		return NULL;
++	if (iio_dma_buffer_cached_mmap) {
++		size_t aligned = PAGE_ALIGN(size);
++		unsigned int i;
++
++		/*
++		 * Physically contiguous, cacheable, no kernel mapping. The
++		 * returned cookie is the first struct page. Highmem pages are
++		 * fine here: the block is only ever touched through the user
++		 * mapping, and the sync helpers operate on physical addresses.
++		 */
++		block->page = dma_alloc_attrs(queue->dev, aligned,
++					      &block->phys_addr, GFP_KERNEL,
++					      DMA_ATTR_NO_KERNEL_MAPPING);
++		if (!block->page) {
++			kfree(block);
++			return NULL;
++		}
++		block->cached = true;
++
++		/*
++		 * dma_alloc_attrs() does not zero memory it did not map. Do
++		 * not leak stale RAM to userspace: zero the pages and write
++		 * the zeros back so no dirty lines are left behind.
++		 */
++		for (i = 0; i < aligned >> PAGE_SHIFT; i++)
++			clear_highpage(block->page + i);
++		dma_sync_single_for_device(queue->dev, block->phys_addr,
++					   aligned, DMA_BIDIRECTIONAL);
++	} else {
++		block->vaddr = dma_alloc_coherent(queue->dev, PAGE_ALIGN(size),
++						  &block->phys_addr, GFP_KERNEL);
++		if (!block->vaddr) {
++			kfree(block);
++			return NULL;
++		}
+ 	}
+ 
+ 	block->block.size = size;
+@@ -976,6 +1073,13 @@
+ 		ret = -EAGAIN;
+ 		goto out_unlock;
+ 	}
++
++	/*
++	 * Done in process context on purpose: invalidating a multi-megabyte
++	 * block line by line takes milliseconds and does not belong in the
++	 * DMA completion tasklet.
++	 */
++	iio_dma_buffer_sync_for_cpu(dma_block, dma_block->block.bytes_used);
+ 
+ 	*block = dma_block->block;
+ 
+@@ -1034,6 +1138,20 @@
+ 
+ 	vma->vm_ops->open(vma);
+ 
++	if (block->cached) {
++		/*
++		 * Plain cacheable mapping (vm_page_prot is left untouched).
++		 * Coherency with the DMA controller is handled by the explicit
++		 * maintenance in submit/dequeue, not by the mapping type.
++		 * Note: this is a VM_PFNMAP mapping, so get_user_pages() and
++		 * therefore MSG_ZEROCOPY/vmsplice on it will not work yet.
++		 */
++		return remap_pfn_range(vma, vma->vm_start,
++				       page_to_pfn(block->page),
++				       vma->vm_end - vma->vm_start,
++				       vma->vm_page_prot);
++	}
++
+ 	return dma_mmap_coherent(queue->dev, vma, block->vaddr,
+ 		block->phys_addr, vma->vm_end - vma->vm_start);
+ }

@@ -119,6 +119,9 @@ process_ini() {
 		echo "disable_usb_console $disable_usb_console" >> /opt/fw_set.tmp
 		echo "enable_ipv6 $enable_ipv6" >> /opt/fw_set.tmp
 		echo "tx_power_save $tx_power_save" >> /opt/fw_set.tmp
+		echo "iio_dma_cached $iio_dma_cached" >> /opt/fw_set.tmp
+		echo "tcp_profile $tcp_profile" >> /opt/fw_set.tmp
+		echo "irq_affinity $irq_affinity" >> /opt/fw_set.tmp
 		fw_setenv -s /opt/fw_set.tmp
 		rm /opt/fw_set.tmp
 		flash_indication_off

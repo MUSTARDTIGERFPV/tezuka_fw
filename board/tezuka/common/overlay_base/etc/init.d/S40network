@@ -63,6 +63,10 @@ create_system_files () {
 		echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6
 	fi
 	TX_POWER_SAVE=$(fw_printenv -n tx_power_save 2> /dev/null || echo no | tr -cd '[a-zA-Z0-9 \\/]._-')
+	# GbE streaming knobs, see doc/gbe_streaming_throughput.md
+	IIO_DMA_CACHED=$(fw_printenv -n iio_dma_cached 2> /dev/null || echo 1 | tr -cd '[0-9]')
+	TCP_PROFILE=$(fw_printenv -n tcp_profile 2> /dev/null || echo wan | tr -cd '[a-z]')
+	IRQ_AFFINITY=$(fw_printenv -n irq_affinity 2> /dev/null || echo on | tr -cd '[a-zA-Z0-9]._-')
 
 	### /etc/udhcpd.conf ###
 	echo "start $IPADDR_HOST" > $UDHCPD_CONF
@@ -211,6 +215,10 @@ create_system_files () {
 	printf "disable_usb_console = %s%s\n" "$DISABLE_USB_CONSOLE" "$CR" >> $CONF
 	printf "enable_ipv6 = %s%s\n" "$ENABLE_IPV6" "$CR" >> $CONF
 	printf "tx_power_save = %s%s\n" "$TX_POWER_SAVE" "$CR" >> $CONF
+	printf "# GbE streaming: cacheable IIO DMA blocks [1|0], TCP profile [wan|lan], IRQ pinning [on|off]%s\n" "$CR" >> $CONF
+	printf "iio_dma_cached = %s%s\n" "$IIO_DMA_CACHED" "$CR" >> $CONF
+	printf "tcp_profile = %s%s\n" "$TCP_PROFILE" "$CR" >> $CONF
+	printf "irq_affinity = %s%s\n" "$IRQ_AFFINITY" "$CR" >> $CONF
 	printf "%s\n" "$CR" >> $CONF
 	### /root/info.html — static USB-MSD info page, NOT the live Dashboard
 	### at /root/index.html (which has no #TOKEN# placeholders to replace) ###
